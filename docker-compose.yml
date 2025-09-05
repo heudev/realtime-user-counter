@@ -1,9 +1,27 @@
-version: '3.8'
+version: '3.9'
+
 services:
-  socket-server:
+  app:
     build: .
+    container_name: realtime-counter
     ports:
       - "3002:3002"
     environment:
-      - NODE_ENV=production
-    restart: always
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+
+volumes:
+  redis_data:

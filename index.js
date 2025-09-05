@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const Redis = require('ioredis');
 
 const app = express();
 app.use(cors());
@@ -10,43 +11,53 @@ app.use(express.json());
 const server = http.createServer(app);
 
 const io = new Server(server, {
-    cors: {
-        origin: true,
-        methods: ["GET", "POST"]
-    },
+    cors: { origin: true, methods: ["GET", "POST"] },
+    transports: ['websocket'],
+    pingInterval: 5000,
+    pingTimeout: 10000
 });
 
-// Domain -> { currentUsers, maxCurrentUsers, maxReachedAt }
+const redis = new Redis({
+    host: 'redis',
+    port: 6379
+});
+
+// Domain -> { currentUsers, maxCurrentUsers, maxReachedAt } (in-memory for currentUsers)
 const domainStats = new Map();
 // socketId -> domain
 const socketDomain = new Map();
 
-function getOrCreateDomain(domain) {
+const REDIS_KEY = 'domainStats';
+
+function nowISO() {
+    return new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
+}
+
+async function getOrCreateDomain(domain) {
     if (!domainStats.has(domain)) {
+        // Load from Redis
+        const data = await redis.hget(REDIS_KEY, domain);
+        let parsed = { maxCurrentUsers: 0, maxReachedAt: null };
+        if (data) {
+            try {
+                parsed = JSON.parse(data);
+            } catch { }
+        }
         domainStats.set(domain, {
             currentUsers: 0,
-            maxCurrentUsers: 0,
-            maxReachedAt: null
+            maxCurrentUsers: parsed.maxCurrentUsers,
+            maxReachedAt: parsed.maxReachedAt
         });
     }
     return domainStats.get(domain);
 }
 
-function nowISO() {
-    return new Date().toLocaleString('tr-TR', {
-        timeZone: 'Europe/Istanbul',
-    });
-}
-
-function broadcastDomain(domain) {
+async function saveDomainToRedis(domain) {
     const stats = domainStats.get(domain);
-    const payload = {
-        domain,
-        currentUsers: stats.currentUsers,
+    await redis.hset(REDIS_KEY, domain, JSON.stringify({
         maxCurrentUsers: stats.maxCurrentUsers,
         maxReachedAt: stats.maxReachedAt
-    };
-    io.to(domain).emit('traffic', payload);
+    }));
 }
 
 function extractDomainFromSocket(socket) {
@@ -56,55 +67,69 @@ function extractDomainFromSocket(socket) {
     try {
         const url = new URL(origin.includes('://') ? origin : `https://${origin}`);
         return url.hostname;
-    } catch (err) {
+    } catch {
         return origin.split('/')[0];
     }
 }
 
-io.on('connection', (socket) => {
+async function broadcastDomain(domain) {
+    const stats = await getOrCreateDomain(domain);
+    const payload = {
+        domain,
+        currentUsers: stats.currentUsers,
+        maxCurrentUsers: stats.maxCurrentUsers,
+        maxReachedAt: stats.maxReachedAt
+    };
+    console.log(`[${nowISO()}] [${domain}] Current: ${stats.currentUsers}, Max: ${stats.maxCurrentUsers} (at ${stats.maxReachedAt})`);
+    io.to(domain).emit('traffic', payload);
+}
+
+io.on('connection', async (socket) => {
     const domain = extractDomainFromSocket(socket) || 'unknown';
     socketDomain.set(socket.id, domain);
 
     socket.join(domain);
 
-    const stats = getOrCreateDomain(domain);
+    const stats = await getOrCreateDomain(domain);
     stats.currentUsers += 1;
+
     if (stats.currentUsers > stats.maxCurrentUsers) {
         stats.maxCurrentUsers = stats.currentUsers;
         stats.maxReachedAt = nowISO();
+        await saveDomainToRedis(domain);
     }
-    broadcastDomain(domain);
 
+    await broadcastDomain(domain);
     socket.emit('connected', { domain, socketId: socket.id });
 
-    socket.on('setDomain', (d) => {
+    socket.on('setDomain', async (newDomain) => {
         const oldDomain = socketDomain.get(socket.id);
-        if (!d || d === oldDomain) return;
+        if (!newDomain || newDomain === oldDomain) return;
 
         socket.leave(oldDomain);
-        const oldStats = getOrCreateDomain(oldDomain);
+        const oldStats = await getOrCreateDomain(oldDomain);
         oldStats.currentUsers = Math.max(0, oldStats.currentUsers - 1);
-        broadcastDomain(oldDomain);
+        await broadcastDomain(oldDomain);
 
-        const newDomain = d;
         socket.join(newDomain);
         socketDomain.set(socket.id, newDomain);
-        const newStats = getOrCreateDomain(newDomain);
+        const newStats = await getOrCreateDomain(newDomain);
         newStats.currentUsers += 1;
         if (newStats.currentUsers > newStats.maxCurrentUsers) {
             newStats.maxCurrentUsers = newStats.currentUsers;
             newStats.maxReachedAt = nowISO();
+            await saveDomainToRedis(newDomain);
         }
-        broadcastDomain(newDomain);
+        await broadcastDomain(newDomain);
     });
 
-    socket.on('disconnect', (reason) => {
+    socket.on('disconnect', async () => {
         const domainOnDisconnect = socketDomain.get(socket.id);
         socketDomain.delete(socket.id);
         if (domainOnDisconnect) {
-            const s = getOrCreateDomain(domainOnDisconnect);
+            const s = await getOrCreateDomain(domainOnDisconnect);
             s.currentUsers = Math.max(0, s.currentUsers - 1);
-            broadcastDomain(domainOnDisconnect);
+            await broadcastDomain(domainOnDisconnect);
         }
     });
 
@@ -113,7 +138,7 @@ io.on('connection', (socket) => {
     });
 });
 
-app.get('/stats', (req, res) => {
+app.get('/stats', async (req, res) => {
     const result = {};
     for (const [domain, s] of domainStats.entries()) {
         result[domain] = {
